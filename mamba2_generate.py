@@ -32,7 +32,7 @@ def main():
     parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name or path")
     parser.add_argument(
         "--instruction", type=str,
-        default="Tell a bedtime story about a dragon and a little village.",
+        default="Tell me a story about a blacksmith who saves a village from a black dragon.",
         help="Instruction string"
     )
     parser.add_argument(
