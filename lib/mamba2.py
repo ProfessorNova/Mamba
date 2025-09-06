@@ -183,6 +183,7 @@ class MambaLM(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.d_state = d_state
+        self.dropout = dropout
 
         # Token embedding and dropout
         self.emb = nn.Embedding(vocab_size, d_model)
