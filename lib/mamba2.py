@@ -296,6 +296,9 @@ class MambaLM(nn.Module):
         out_tokens = tokens.clone()
         cur_states = states
 
+        if cur_states is None:
+            logits, cur_states = self(tokens, states=None, return_state=True)
+
         for _ in range(max_new_tokens):
             # Only feed the last token to the model to save computation
             logits, cur_states = self(tokens[:, -1:], states=cur_states, return_state=True)
