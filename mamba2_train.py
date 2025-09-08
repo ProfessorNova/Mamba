@@ -68,7 +68,7 @@ def main():
 
     print("Loader length:", len(train_loader))
     sample_inputs, sample_targets = train_loader.__iter__().__next__()
-    print("Example input:\n", tokenizer.decode(sample_inputs[0], skip_special_tokens=True))
+    print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0], skip_special_tokens=True)}\n")
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
