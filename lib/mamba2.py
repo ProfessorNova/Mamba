@@ -3,18 +3,10 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from causal_conv1d import causal_conv1d_fn
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization.
-
-    RMSNorm is similar to LayerNorm but normalizes by the root mean
-    square of the activations instead of the variance. It has been
-    adopted in several state‑space models because it provides robust
-    scaling without introducing biases. This implementation follows
-    recent open‑source models such as Mamba and LLaMA.
-    """
-
     def __init__(self, d_model: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d_model))
@@ -28,18 +20,6 @@ class RMSNorm(nn.Module):
 
 
 class MambaBlock(nn.Module):
-    """A simplified Mamba‑2 block implementing a recurrent SSM layer.
-
-    The block operates on a 3D tensor of shape (batch, seq_len, d_model).
-    It maintains a per‑head state tensor of shape (batch, n_heads, d_state).
-    At each time step ``t`` it computes input‑dependent decay ``delta_t``,
-    additive input ``B_t`` and output projection ``C_t``. The state is
-    updated as ``h_{t+1} = delta_t * h_t + B_t`` and the SSM output is
-    ``y_ssm = C_t * h_{t+1}``. A gating vector ``g_t`` mixes this output
-    with the original input. Finally the result is projected back to
-    ``d_model`` dimensions and added to the input (residual connection).
-    """
-
     def __init__(
             self,
             d_model: int,
@@ -57,10 +37,21 @@ class MambaBlock(nn.Module):
         self.n_heads = n_heads
         self.d_state = d_state
         self.dropout = dropout
+        self.kernel_size = 4  # Kernel for causal convolution
 
         # Optional normalization at the beginning of the block to stabilize
         # training, as suggested in NormFormer and adopted in Mamba‑2【321109661959848†L1947-L1955】.
         self.norm = RMSNorm(d_model) if use_norm else nn.Identity()
+
+        # Causal convolution to mix information from neighboring tokens.
+        self.conv1d = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=self.kernel_size,
+            groups=d_model,
+            padding=self.kernel_size - 1,
+            bias=True,
+        )
 
         # Linear projections to compute gating and SSM parameters. We project
         # the normalized input into three sets of parameters per head:
@@ -85,31 +76,21 @@ class MambaBlock(nn.Module):
             x: torch.Tensor,
             state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply the block to an input sequence.
-
-        Parameters
-        ----------
-        x: Tensor
-            Input tensor of shape (batch, seq_len, d_model).
-        state: Optional[Tensor]
-            Optional initial state tensor of shape (batch, n_heads, d_state).
-            If provided, it is used as the starting hidden state. If None,
-            the hidden state is initialized to zeros.
-
-        Returns
-        -------
-        y: Tensor
-            Output tensor of shape (batch, seq_len, d_model).
-        new_state: Tensor
-            Final hidden state tensor to be passed into the next call if
-            continuing a sequence.
-        """
         bsz, seqlen, _ = x.shape
         # Normalize input
         x_norm = self.norm(x)
 
-        # Compute gating values (batch, seq_len, d_model)
-        gate = torch.sigmoid(self.gate_proj(x_norm))
+        # Temporal mixing via causal convolution
+        bsz, seqlen, d_model = x_norm.shape
+        xt = x_norm.transpose(1, 2).contiguous()  # (B, D, L)
+        w = self.conv1d.weight.view(d_model, self.kernel_size).contiguous()
+        bt = self.conv1d.bias
+        # Using the custom CUDA kernel for efficiency
+        x_conv_t = causal_conv1d_fn(x=xt, weight=w, bias=bt, activation="silu")
+        x_conv = x_conv_t.transpose(1, 2)
+
+        # Gating and SSM parameter projection
+        gate = torch.sigmoid(self.gate_proj(x_conv))  # (B, L, D)
 
         # Compute SSM parameters (batch, seq_len, n_heads, d_state)
         params = self.param_proj(x_norm)
@@ -166,8 +147,6 @@ class MambaBlock(nn.Module):
 
 
 class MambaLM(nn.Module):
-    """A small autoregressive language model built from MambaBlocks."""
-
     def __init__(
             self,
             vocab_size: int,
@@ -213,30 +192,6 @@ class MambaLM(nn.Module):
             states: Optional[List[torch.Tensor]] = None,
             return_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        """Forward pass through the language model.
-
-        Parameters
-        ----------
-        tokens: Tensor
-            Input token ids of shape (batch, seq_len).
-        states: Optional[List[Tensor]]
-            List of per‑layer hidden states. Each state should have shape
-            (batch, n_heads, d_state). If None, zeros are used.
-        return_state: bool, default=False
-            Whether to return the final states. During training on
-            independent examples this can be false; during generation
-            returning states enables streaming inference.
-
-        Returns
-        -------
-        logits: Tensor
-            Logits over the vocabulary of shape (batch, seq_len, vocab_size).
-        new_states: Optional[List[Tensor]]
-            List of new hidden states, if ``return_state`` is True.
-        """
-        bsz, seqlen = tokens.shape
-        device = tokens.device
-
         # Embed tokens
         x = self.emb(tokens)  # (batch, seq_len, d_model)
         x = self.emb_dropout(x)
@@ -268,31 +223,6 @@ class MambaLM(nn.Module):
             temperature: float = 1.0,
             top_k: Optional[int] = None,
     ) -> torch.Tensor:
-        """Generate a continuation of ``max_new_tokens`` tokens.
-
-        Parameters
-        ----------
-        tokens: Tensor
-            Input token ids of shape (batch, seq_len). Typically the
-            prompt to condition on.
-        max_new_tokens: int
-            Number of new tokens to sample.
-        states: Optional[List[Tensor]]
-            Optionally provide hidden states to continue generation from
-            previous calls.
-        temperature: float
-            Sampling temperature. Values <1.0 sharpen the distribution.
-        top_k: Optional[int]
-            If provided, only the top_k most probable tokens will be
-            considered when sampling at each step.
-
-        Returns
-        -------
-        output: Tensor
-            Concatenation of the input tokens and the newly sampled tokens
-            of shape (batch, seq_len + max_new_tokens).
-        """
-        bsz = tokens.size(0)
         out_tokens = tokens.clone()
         cur_states = states
 

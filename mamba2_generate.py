@@ -1,14 +1,15 @@
 import argparse
 
 import torch
-from transformers import AutoTokenizer
 
+from lib.byte_tokenizer import ByteTokenizer
 from lib.mamba2 import MambaLM
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text with a Mamba2 model")
-    parser.add_argument("--ckpt", type=str, default="best.pt", help="Path to checkpoint file")
+    parser.add_argument("--ckpt", type=str, default="best.pt",
+                        help="Path to checkpoint file")
     parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name or path")
     parser.add_argument(
         "--input", type=str,
@@ -16,11 +17,11 @@ def main():
         help="Input text"
     )
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
     args = parser.parse_args()
 
-    device = torch.device("cpu")
+    device = torch.device("cuda")
 
     # Load checkpoint
     ckpt = torch.load(args.ckpt, map_location=device)
@@ -32,14 +33,14 @@ def main():
     model.eval()
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = ByteTokenizer(add_bos=False, add_eos=False)
 
     # Build prompt
     prompt = args.input
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    input_ids = torch.tensor(
+        tokenizer.encode(prompt),
+        dtype=torch.long
+    ).unsqueeze(0).to(device)
 
     # Generate
     with torch.no_grad():

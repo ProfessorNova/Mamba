@@ -5,9 +5,9 @@ import torch.nn as nn
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoTokenizer
 
 from lib.mamba2 import MambaLM
+from lib.byte_tokenizer import ByteTokenizer
 
 
 def main():
@@ -21,10 +21,7 @@ def main():
         device = torch.device('cpu')
     print(f'Using device: {device}')
 
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = ByteTokenizer(add_bos=False, add_eos=True)
     MAX_LEN = 1024
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
@@ -40,10 +37,10 @@ def main():
 
         def __getitem__(self, idx):
             text = (self.raw[idx]['text'] or "").strip()
-            ids = tokenizer(text, add_special_tokens=False, truncation=True, max_length=MAX_LEN)['input_ids']
+            ids = tokenizer.encode(text)
             if len(ids) == 0:
-                ids = [tokenizer.eos_token_id]
-            ids = ids + [tokenizer.eos_token_id]
+                ids = [tokenizer.EOS]
+            ids = ids[:MAX_LEN]
             input_ids = torch.tensor(ids[:-1], dtype=torch.long)
             targets = torch.tensor(ids[1:], dtype=torch.long)
             return input_ids, targets
@@ -72,9 +69,9 @@ def main():
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
-    d_model = 640
-    n_layers = 8
-    n_heads = 8
+    d_model = 768
+    n_layers = 12
+    n_heads = 12
     d_state = d_model // n_heads
     dropout = 0.1
 
@@ -105,12 +102,10 @@ def main():
     fixed_prompt = (
         "Once upon a time, in a nice little town, there lived a big dragon."
     )
-    fixed_prompt_ids = tokenizer(
-        fixed_prompt,
-        return_tensors='pt',
-        max_length=MAX_LEN,
-        truncation=True
-    )['input_ids'].to(device)
+    fixed_prompt_ids = torch.tensor(
+        tokenizer.encode(fixed_prompt)[:MAX_LEN],
+        dtype=torch.long
+    ).unsqueeze(0).to(device)
 
     for epoch in range(train_epochs):
         epoch_total_loss = 0.0
