@@ -8,20 +8,18 @@ from lib.mamba2 import MambaLM
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text with a Mamba2 model")
-    parser.add_argument("--ckpt", type=str, default="best.pt",
-                        help="Path to checkpoint file")
-    parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name or path")
+    parser.add_argument("--ckpt", type=str, default="best.pt", help="Path to checkpoint file")
     parser.add_argument(
         "--input", type=str,
         default="Once upon a time, in a nice little town, there lived a big dragon.",
         help="Input text"
     )
-    parser.add_argument("--max_new_tokens", type=int, default=200, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.3, help="Sampling temperature")
+    parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
     args = parser.parse_args()
 
-    device = torch.device("cuda")
+    device = torch.device("cpu")
 
     # Load checkpoint
     ckpt = torch.load(args.ckpt, map_location=device)

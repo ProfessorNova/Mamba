@@ -22,50 +22,64 @@ def main():
     print(f'Using device: {device}')
 
     tokenizer = ByteTokenizer(add_bos=False, add_eos=True)
-    MAX_LEN = 1024
+    tok_noeos = ByteTokenizer(add_bos=False, add_eos=False)
+    MAX_LEN = 2048
+    NUM_TRAIN_EXAMPLES = 250_000
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
+    stories_ds = stories_ds.select(range(NUM_TRAIN_EXAMPLES))
 
-    class TrainDataset(Dataset):
-        # Simple language modeling dataset without instruction formatting.
-        # Each example is tokenized up to MAX_LEN.
-        def __init__(self, raw_dataset):
-            self.raw = raw_dataset
+    # Packed, fixed-length LM dataset (no padding, no masks).
+    class PackedLM(Dataset):
+        """
+        Concatenate all tokenized examples (each ends with EOS) and slice
+        fixed windows of length (max_len + 1) to form (input, target) pairs.
+        """
 
-        def __len__(self):
-            return len(self.raw)
+        def __init__(self, hf_split, tokenizer: ByteTokenizer, max_len: int, stride: int | None = None):
+            self.max_len = max_len
+            window_len = max_len + 1  # input+target length
+            self.stride = window_len if stride is None else stride  # non-overlapping by default
+
+            buf: list[int] = []
+            for rec in hf_split:
+                text = (rec["text"] or "").strip()
+                ids = tokenizer.encode(text)  # already appends EOS (by construction)
+                if not ids:
+                    ids = [tokenizer.EOS]
+                buf.extend(ids)
+
+            self.seqs: list[list[int]] = []
+            # Build windows [i : i+window_len] with given stride
+            for i in range(0, max(0, len(buf) - window_len + 1), self.stride):
+                self.seqs.append(buf[i:i + window_len])
+
+            if not self.seqs:
+                raise RuntimeError("PackedLM: buffer too small for the chosen MAX_LEN.")
+
+        def __len__(self) -> int:
+            return len(self.seqs)
 
         def __getitem__(self, idx):
-            text = (self.raw[idx]['text'] or "").strip()
-            ids = tokenizer.encode(text)
-            if len(ids) == 0:
-                ids = [tokenizer.EOS]
-            ids = ids[:MAX_LEN]
-            input_ids = torch.tensor(ids[:-1], dtype=torch.long)
-            targets = torch.tensor(ids[1:], dtype=torch.long)
-            return input_ids, targets
+            seq = torch.tensor(self.seqs[idx], dtype=torch.long)
+            # Next-token prediction: shift by 1
+            return seq[:-1], seq[1:]
 
-    stories_train_ds = TrainDataset(stories_ds)
-
-    def collate_train(examples):
-        inputs = [ex[0] for ex in examples]
-        targets = [ex[1] for ex in examples]
-        inputs_pad = nn.utils.rnn.pad_sequence(inputs, batch_first=True, padding_value=tokenizer.pad_token_id)
-        targets_pad = nn.utils.rnn.pad_sequence(targets, batch_first=True, padding_value=-100)
-        return inputs_pad, targets_pad
+    stories_train_ds = PackedLM(stories_ds, tokenizer, max_len=MAX_LEN)
 
     train_loader = DataLoader(
         stories_train_ds,
         batch_size=4,
         shuffle=True,
-        collate_fn=collate_train,
+        drop_last=True,
         num_workers=0,
         pin_memory=True,
     )
 
     print("Loader length:", len(train_loader))
     sample_inputs, sample_targets = train_loader.__iter__().__next__()
-    print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0], skip_special_tokens=True)}\n")
+    print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0])[:512]}\n")
+    print(f"Example target:\n\n{tokenizer.decode(sample_targets[0])[:512]}\n")
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
@@ -84,10 +98,10 @@ def main():
     print("Number of parameters:", sum(p.numel() for p in model.parameters()))
 
     # Training hyperparameters
-    train_epochs = 1
+    train_epochs = 5
     train_log_interval = 10
     sample_interval = 100
-    sample_length = 100
+    sample_length = 256
 
     # TensorBoard writer
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -103,7 +117,7 @@ def main():
         "Once upon a time, in a nice little town, there lived a big dragon."
     )
     fixed_prompt_ids = torch.tensor(
-        tokenizer.encode(fixed_prompt)[:MAX_LEN],
+        tok_noeos.encode(fixed_prompt)[:MAX_LEN],
         dtype=torch.long
     ).unsqueeze(0).to(device)
 
@@ -151,9 +165,9 @@ def main():
             if step % sample_interval == 0:
                 model.eval()
                 with torch.no_grad():
-                    gen_ids = model.generate(fixed_prompt_ids, max_new_tokens=sample_length)
+                    gen_ids = model.generate(fixed_prompt_ids, max_new_tokens=sample_length, temperature=0.7, top_k=50)
                 new_tokens = gen_ids[0][fixed_prompt_ids.size(1):]
-                sample_text = tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+                sample_text = tokenizer.decode(new_tokens.tolist())
                 print('\n--- Sample Generation ---')
                 print(f'{fixed_prompt}{sample_text}')
                 print('-------------------------\n')
