@@ -8,15 +8,16 @@ from lib.mamba2 import MambaLM
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text with a Mamba2 model")
-    parser.add_argument("--ckpt", type=str, default="best.pt", help="Path to checkpoint file")
+    parser.add_argument("--ckpt", type=str, default="last.pt", help="Path to checkpoint file")
     parser.add_argument(
         "--input", type=str,
         default="Once upon a time, in a nice little town, there lived a big dragon.",
         help="Input text"
     )
-    parser.add_argument("--max_new_tokens", type=int, default=1024, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
+    parser.add_argument("--top_k", type=int, default=None, help="Top-k sampling")
+    parser.add_argument("--top_p", type=float, default=0.92, help="Top-p sampling")
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -31,7 +32,7 @@ def main():
     model.eval()
 
     # Load tokenizer
-    tokenizer = ByteTokenizer(add_bos=False, add_eos=False)
+    tokenizer = ByteTokenizer(add_eos=False)
 
     # Build prompt
     prompt = args.input
@@ -47,11 +48,12 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
         )
 
     # Strip the prompt part for readability
     new_tokens = gen_ids[0, input_ids.shape[1]:]
-    output = tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+    output = tokenizer.decode(new_tokens.tolist())
     print(f"{prompt}{output}", end="\n\n")
 
 
