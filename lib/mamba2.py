@@ -3,48 +3,80 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functorch.einops import rearrange
+from torch.nn import RMSNorm
 
 
-class RMSNorm(nn.Module):
+def segsum(x: torch.Tensor) -> torch.Tensor:
     """
-    Root mean square normalization.
-
-    This implementation normalizes the input along the last dimension,
-    multiplies by a learned weight, and avoids subtracting the mean.
+    Naive segment sum calculation. exp(segsum(A)) produces a 1-SS matrix,
+    which is equivalent to a scalar SSM.
     """
+    T = x.size(-1)
+    x_cumsum = torch.cumsum(x, dim=-1)
+    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+    return x_segsum
 
-    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., D)
-        # Compute RMS along the last dimension
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return self.weight * x / rms
+def ssd(X: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
+        block_len: int, initial_states: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Arguments:
+        X: (batch, length, n_heads, d_head)
+        A: (batch, length, n_heads)
+        B: (batch, length, n_heads, d_state)
+        C: (batch, length, n_heads, d_state)
+        block_len: int - length of each chunk/block
+        initial_states: (batch, n_heads, d_head, d_state) or None - initial SSM states
+
+    Return:
+        Y: (batch, length, n_heads, d_head)
+        final_states: (batch, n_heads, d_head, d_state)
+    """
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+    assert X.shape[1] % block_len == 0
+    # Rearrange into blocks/chunks
+    X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
+    A = rearrange(A, "b c l h -> b h c l")
+    A_cumsum = torch.cumsum(A, dim=-1)
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    L = torch.exp(segsum(A))
+    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
+    # 2. Compute the state for each intra-chunk
+    # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
+    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+    # (middle term of factorization of off-diag blocks; A terms)
+    if initial_states is None:
+        initial_states = torch.zeros_like(states[:, :1])
+    else:
+        # Add chunk dimension
+        initial_states = initial_states.unsqueeze(1)
+    states = torch.cat([initial_states, states], dim=1)
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+    states, final_state = new_states[:, :-1], new_states[:, -1]
+    # 4. Compute state -> output conversion per chunk
+    # (left term of low-rank factorization of off-diagonal blocks; C terms)
+    state_decay_out = torch.exp(A_cumsum)
+    Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    return Y, final_state
 
 
 class MambaBlock(nn.Module):
     """
-    A single Mamba‑2 block implementing a selective SSM with local mixing.
+    A single Mamba‑2 block.
 
-    Parameters
-    ----------
-    d_model : int
-        Total model dimension (D = n_heads * head_dim).
-    n_heads : int
-        Number of heads. The head dimension is inferred as d_model // n_heads.
-    d_state : int
-        Dimension of the SSM state. This is independent of the head dimension.
-    d_conv : int, optional
-        Kernel size of the depthwise convolution used for local mixing. Defaults to 4.
-    dt_min, dt_max : float, optional
-        Range for the learned time step dt. Delta is computed as exp(-dt).
-    dropout : float, optional
-        Dropout probability applied after the output projection.
-    use_norm : bool, optional
-        Whether to apply RMSNorm to the block input.
+    Arguments:
+        d_model (int): Total model dimension (D = n_heads * head_dim).
+        n_heads (int): Number of heads. The head dimension is inferred as d_model // n_heads.
+        d_state (int): Dimension of the SSM state. This is independent of the head dimension.
+        d_conv (int, optional): Kernel size of the depthwise convolution used for local mixing. Defaults to 4.
     """
 
     def __init__(
@@ -53,10 +85,6 @@ class MambaBlock(nn.Module):
             n_heads: int,
             d_state: int,
             d_conv: int = 4,
-            dt_min: float = 1e-4,
-            dt_max: float = 0.1,
-            dropout: float = 0.0,
-            use_norm: bool = True,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -65,129 +93,109 @@ class MambaBlock(nn.Module):
         self.d_state = d_state
         self.d_head = d_model // n_heads
         self.d_conv = d_conv
-        self.dt_min = dt_min
-        self.dt_max = dt_max
-        self.dropout = dropout
 
-        # Input normalization
-        self.norm = RMSNorm(d_model) if use_norm else nn.Identity()
+        # Project once into all SSD pieces: X, A, B, C
+        # X: (n_heads * d_head) == d_model
+        # A: (n_heads)
+        # B: (d_state)  -- shared across heads
+        # C: (d_state)  -- shared across heads
+        proj_out = d_model + n_heads + 2 * d_state  # B and C are shared across heads
+        self.linear_proj = nn.Linear(d_model, proj_out, bias=False)
 
-        # Parallel projections: dt (per head), B and C (per head and state)
-        # dt_proj outputs (B, L, n_heads)
-        self.dt_proj = nn.Linear(d_model, n_heads)
-        # param_proj outputs (B, L, 2 * n_heads * d_state) for B and C
-        self.param_proj = nn.Linear(d_model, 2 * n_heads * d_state)
-
-        # Depthwise causal conv for local mixing
+        # Depthwise 1D conv for local mixing (causal via manual left padding)
         self.conv1d = nn.Conv1d(
             in_channels=d_model,
             out_channels=d_model,
             kernel_size=d_conv,
             groups=d_model,
-            padding=d_conv - 1,
-            bias=True,
+            bias=False,
+            padding=0,
         )
 
-        # Gate projection to mix SSM output and input
-        self.gate_proj = nn.Linear(d_model, d_model)
+        # Gate projection
+        self.gate_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # Normalization before output projection
+        self.norm = RMSNorm(d_model)
 
         # Output projection
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        # Extra normalization before output projection (NormFormer style)
-        self.extra_norm = RMSNorm(d_model)
-
-        # Dropout layer
-        self.dropout_layer = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
     def forward(
             self,
             x: torch.Tensor,
             state: Optional[torch.Tensor] = None,
+            block_len: int = 64,
             reset_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply the Mamba‑2 block to a sequence.
+        Apply the Mamba-2 block to a sequence.
 
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape (B, L, D).
-        state : torch.Tensor, optional
-            Previous state of shape (B, n_heads, d_state). If None, initialized to zeros.
-        reset_mask : torch.Tensor, optional
-            A binary mask of shape (B, L) indicating where to reset the state.
+        Arguments:
+            x: (batch, length, d_model) - input sequence
+            state: (batch, n_heads, d_head, d_state) or None - previous SSM state
+            block_len: int - chunk length for SSM computation; default 64
+            reset_mask: (batch, length) or None - binary mask; 1 cuts the recurrence between t-1 and t
 
-        Returns
-        -------
-        y : torch.Tensor
-            Output tensor of shape (B, L, D).
-        new_state : torch.Tensor
-            New state tensor of shape (B, n_heads, d_state).
+        Returns:
+            y: (batch, length, d_model) - output sequence
+            final_state: (batch, n_heads, d_head, d_state) - final SSM state
         """
-        B, L, D = x.shape
-        H = self.n_heads
-        N = self.d_state
+        Bsz, L, D = x.shape
+        H, P, N = self.n_heads, self.d_head, self.d_state
 
-        # Normalize input
-        x_norm = self.norm(x)
-
-        # Compute dt_raw, B_t, C_t from the normalized input (parallel projection)
-        dt_raw = self.dt_proj(x_norm)  # (B, L, H)
-        param_out = self.param_proj(x_norm)  # (B, L, 2*H*N)
-        param_out = param_out.view(B, L, H, 2, N)  # (B, L, H, 2, N)
-        B_t, C_t = param_out.unbind(dim=3)  # each (B, L, H, N)
-
-        # Convert dt_raw to dt in [dt_min, dt_max], then delta = exp(-dt)
-        dt = self.dt_min + torch.sigmoid(dt_raw) * (self.dt_max - self.dt_min)  # (B, L, H)
-        delta = torch.exp(-dt)  # (B, L, H)
-
-        # Local mixing via depthwise causal convolution
-        # Transpose to (B, D, L) for conv1d
-        xt = x_norm.transpose(1, 2).contiguous()
-        x_conv = F.silu(self.conv1d(xt)).transpose(1, 2)  # (B, L, D)
-        # Trim padding to keep strict causality
-        x_conv = x_conv[:, :L, :]
-
-        # Gating between SSM output and input
-        gate = torch.sigmoid(self.gate_proj(x_conv))  # (B, L, D)
-
-        # Prepare initial state
-        if state is None:
-            h = torch.zeros(B, H, N, dtype=x.dtype, device=x.device)
+        # Local (causal) depthwise mixing + SiLU gate
+        # expects (B, C, L); left-pad by (k-1) for causality.
+        x_ch = x.transpose(1, 2)  # (B, D, L)
+        if self.d_conv > 1:
+            x_conv = self.conv1d(F.pad(x_ch, (self.d_conv - 1, 0)))  # (B, D, L)
         else:
-            h = state
+            x_conv = self.conv1d(x_ch)  # degenerate 1x1 depthwise
+        x_mixed = F.silu(x_conv.transpose(1, 2)) * x  # (B, L, D)
 
-        # Perform per-step recurrence
-        hs = []  # list to collect states at each timestep
-        for t in range(L):
-            # Reset state if reset_mask is provided
-            if reset_mask is not None:
-                reset = reset_mask[:, t].unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-                h = h * ~reset  # reset state where mask is 1
-            # Update state: h_t = delta_t * h_{t-1} + B_t
-            h = delta[:, t].unsqueeze(-1) * h + B_t[:, t]
-            hs.append(h)
-        # Stack to form (B, L, H, N)
-        h_all = torch.stack(hs, dim=1)
+        # One big projection -> split into X, A, B, C
+        proj = self.linear_proj(x_mixed)  # (B, L, D + H + 2*N)
+        off0 = 0
+        x_part = proj[..., off0: off0 + D]
+        off0 += D  # (B, L, D)
+        a_part = proj[..., off0: off0 + H]
+        off0 += H  # (B, L, H)
+        b_part = proj[..., off0: off0 + N]
+        off0 += N  # (B, L, N)
+        c_part = proj[..., off0: off0 + N]  # (B, L, N)
 
-        # Compute SSM output: (C_t * h_all) -> (B, L, D) via reshape
-        ssm_out = (C_t * h_all).reshape(B, L, D)
+        # Reshape / map to SSD pieces
+        X = x_part.view(Bsz, L, H, P).contiguous()  # (B, L, H, P)
+        A = F.logsigmoid(a_part)  # (B, L, H), ensures stability
 
-        # Mix SSM output with the input using the gate
-        mixed = gate * ssm_out + (1.0 - gate) * x_norm
+        # Share B,C across heads -> broadcast, then apply activation
+        Bv = F.silu(b_part.unsqueeze(-2).expand(Bsz, L, H, N))  # (B, L, H, N)
+        Cv = F.silu(c_part.unsqueeze(-2).expand(Bsz, L, H, N))  # (B, L, H, N)
+        X = F.silu(X)
 
-        # Extra normalization before output projection
-        mixed_norm = self.extra_norm(mixed)
+        # Optional resets: break recurrence between t-1 and t where reset_mask[t] = 1
+        if reset_mask is not None:
+            # shape (B, L, 1) -> broadcast over H
+            reset_log = (-1e9) * reset_mask.unsqueeze(-1).to(A.dtype)  # (B, L, 1)
+            A = A + reset_log  # (B, L, H)
 
-        # Output projection + dropout + residual connection
-        y = self.out_proj(mixed_norm)
-        y = self.dropout_layer(y)
+        # SSD compute
+        Y, final_state = ssd(
+            X=X,
+            A=A,
+            B=Bv,
+            C=Cv,
+            block_len=block_len,
+            initial_states=state,
+        )  # Y: (B, L, H, P)
+
+        gate = torch.sigmoid(self.gate_proj(x_mixed))  # (B, L, D)
+        y_core = Y.reshape(Bsz, L, D) * gate  # selective gating on SSM output
+        y = self.out_proj(self.norm(y_core))
+
+        # Residual connection
         y = y + x
-
-        # New state is the last hidden state
-        new_state = h_all[:, -1]
-        return y, new_state
+        return y, final_state
 
 
 class MambaLM(nn.Module):
@@ -197,6 +205,14 @@ class MambaLM(nn.Module):
     This model embeds tokens into continuous representations, applies a
     sequence of Mamba‑2 blocks, normalizes the output, and projects to
     vocabulary logits. The embedding and output projection weights are tied.
+
+    Arguments:
+        vocab_size (int): Size of the vocabulary.
+        d_model (int): Total model dimension (D = n_heads * head_dim). Default
+        n_layers (int): Number of Mamba‑2 blocks to stack. Default is 4.
+        n_heads (int): Number of attention heads. Default is 4.
+        d_state (int): Dimension of the SSM state in each head. Default is
+        d_conv (int): Kernel size of the depthwise convolution used for local mixing. Default is 4.
     """
 
     def __init__(
@@ -206,11 +222,7 @@ class MambaLM(nn.Module):
             n_layers: int = 4,
             n_heads: int = 4,
             d_state: int = 64,
-            dropout: float = 0.1,
-            dt_min: float = 1e-4,
-            dt_max: float = 0.1,
             d_conv: int = 4,
-            use_norm: bool = True,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -219,13 +231,11 @@ class MambaLM(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.d_state = d_state
-        self.dropout = dropout
 
         # Embedding layer
         self.emb = nn.Embedding(vocab_size, d_model)
-        self.emb_dropout = nn.Dropout(dropout)
 
-        # Stack of Mamba‑2 blocks
+        # Stack of Mamba-2 blocks
         self.layers = nn.ModuleList(
             [
                 MambaBlock(
@@ -233,10 +243,6 @@ class MambaLM(nn.Module):
                     n_heads=n_heads,
                     d_state=d_state,
                     d_conv=d_conv,
-                    dt_min=dt_min,
-                    dt_max=dt_max,
-                    dropout=dropout,
-                    use_norm=use_norm,
                 )
                 for _ in range(n_layers)
             ]
@@ -254,39 +260,34 @@ class MambaLM(nn.Module):
             tokens: torch.Tensor,
             states: Optional[List[torch.Tensor]] = None,
             reset_mask: Optional[torch.Tensor] = None,
+            block_len: int = 64,
             return_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
         Forward pass of the language model.
 
-        Parameters
-        ----------
-        tokens : torch.Tensor
-            Token IDs of shape (B, L).
-        states : list of torch.Tensor, optional
-            A list of previous states for each layer. Each state should have
-            shape (B, n_heads, d_state). If None, all states are initialized
-            to zeros.
-        reset_mask : torch.Tensor, optional
-            A binary mask of shape (B, L) indicating where to reset the states.
-        return_state : bool, optional
-            If True, returns the new states for each layer.
+        Arguments:
+            tokens: (batch, length) - input token IDs
+            states: optional list of per-layer states; each tensor is (batch, n_heads, d_head, d_state)
+            reset_mask: (batch, length) or None - binary mask indicating where to reset states
+            block_len: chunk length for SSM computation; default 64
+            return_state: whether to return the new states
 
-        Returns
-        -------
-        logits : torch.Tensor
-            Vocabulary logits of shape (B, L, vocab_size).
-        new_states : list of torch.Tensor or None
-            List of new states for each layer if return_state is True; otherwise
-            None.
+        Returns:
+            logits: (batch, length, vocab_size)
+            new_states: list of tensors with shape (batch, n_heads, d_head, d_state) for each layer (or None)
         """
         x = self.emb(tokens)  # (B, L, D)
-        x = self.emb_dropout(x)
         if states is None:
             states = [None] * self.n_layers
         new_states = []
         for i, layer in enumerate(self.layers):
-            x, s = layer(x, state=states[i], reset_mask=reset_mask)
+            x, s = layer(
+                x,
+                state=states[i],
+                block_len=block_len,
+                reset_mask=reset_mask
+            )
             new_states.append(s)
         x = self.final_norm(x)
         logits = self.head(x)
@@ -306,40 +307,38 @@ class MambaLM(nn.Module):
         """
         Generate tokens autoregressively.
 
-        Parameters
-        ----------
-        tokens : torch.Tensor
-            Starting sequence of shape (B, L).
-        max_new_tokens : int
-            Maximum number of new tokens to generate.
-        states : list of torch.Tensor, optional
-            Cached states for each layer; see forward.
-        temperature : float
-            Temperature for sampling; >1.0 flattens the distribution.
-        top_k : int, optional
-            Top‑k sampling; if provided, only the k most likely tokens are
-            considered.
-        top_p : float, optional
-            Nucleus (top‑p) sampling; if provided, selects the smallest set of
-            tokens with cumulative probability <= p.
-        eos_id : int, optional
-            If provided, generation stops when all sequences emit this token.
+        Arguments:
+            tokens (torch.Tensor): (B, L) - input sequence of token IDs
+            max_new_tokens (int): maximum number of new tokens to generate
+            states: optional list of cached per-layer states, each (batch, n_heads, d_head, d_state)
+            temperature (float): sampling temperature
+            top_k (int, optional): if set, use top-k sampling
+            top_p (float, optional): if set, use nucleus (top-p) sampling
+            eos_id (int, optional): if set, stop generation when this token ID is generated
 
-        Returns
-        -------
-        tokens : torch.Tensor
-            The original sequence concatenated with the generated tokens.
+        Returns:
+            out_tokens: (batch, length + max_new_tokens)
         """
         out_tokens = tokens.clone()
         cur_states = states
         if cur_states is None:
             # Initialize states by running the model on the prompt
-            _, cur_states = self(tokens, states=None, return_state=True)
+            _, cur_states = self(
+                tokens,
+                states=None,
+                block_len=1,
+                return_state=True
+            )
 
         finished = torch.zeros(tokens.size(0), dtype=torch.bool, device=tokens.device)
 
         for _ in range(max_new_tokens):
-            logits, cur_states = self(tokens[:, -1:], states=cur_states, return_state=True)
+            logits, cur_states = self(
+                tokens[:, -1:],
+                states=cur_states,
+                block_len=1,
+                return_state=True
+            )
             logits = logits[:, -1] / max(temperature, 1e-6)
             if top_k is not None:
                 topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
