@@ -78,6 +78,7 @@ def main():
     tokenizer = ByteTokenizer(add_eos=True)
     tok_no_eos = ByteTokenizer(add_eos=False)
     MAX_LEN = 512
+    BATCH_SIZE = 32
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
 
@@ -85,7 +86,7 @@ def main():
 
     train_loader = DataLoader(
         stories_train_ds,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
         shuffle=True,
         drop_last=True,
     )
@@ -106,29 +107,33 @@ def main():
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    train_epochs = 1
-    train_log_interval = 10
-    sample_interval = 100
-    sample_length = 256
-    accum_steps = 32
-    total_steps = int(len(train_loader) * train_epochs / accum_steps)
+    TRAIN_EPOCHS = 1
+    TRAIN_LOG_INTERVAL = 10
+    SAMPLE_INTERVAL = 100
+    SAMPLE_LENGTH = 256
+    ACCUM_STEPS = 32
+    total_steps = int(len(train_loader) * TRAIN_EPOCHS / ACCUM_STEPS)
     print(f'Total training steps: {_fmt(total_steps)}')
+    print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
 
     # Optimizer, scheduler, criterion
+    BASE_LR = 6e-4
+    MIN_LR = 1e-5
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=6e-4, betas=(0.9, 0.95), weight_decay=0.1,
+        model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), weight_decay=0.1,
     )
     criterion = nn.CrossEntropyLoss()
 
     # Cosine w/ warmup scheduler (step-wise)
-    warmup = max(100, int(0.03 * total_steps))
-    print(f'Warmup steps: {warmup}')
+    warmup_steps = max(100, int(0.03 * total_steps))
+    print(f'Warmup steps: {warmup_steps}')
 
-    def lr_lambda(step):
-        if step < warmup:
-            return max(1e-8, step / max(1, warmup))
-        progress = (step - warmup) / max(1, total_steps - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    def lr_lambda(lr_step):
+        if lr_step < warmup_steps:
+            return max(1e-8, lr_step / max(1, warmup_steps))
+        progress = min(1.0, lr_step / max(1, total_steps))
+        decay_to = MIN_LR / BASE_LR
+        return decay_to + (1 - decay_to) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -147,7 +152,7 @@ def main():
     step = 0
     best_loss = float('inf')
 
-    for epoch in range(train_epochs):
+    for epoch in range(TRAIN_EPOCHS):
         epoch_total_loss = 0.0
         epoch_batches = 0
         model.train()
@@ -168,12 +173,12 @@ def main():
                 loss = criterion(logits.view(-1, vocab_size), targets.view(-1))
 
             # grad accumulation
-            (loss / accum_steps).backward()
+            (loss / ACCUM_STEPS).backward()
             micro_i += 1
             epoch_total_loss += loss.item()
             epoch_batches += 1
 
-            if micro_i % accum_steps == 0:
+            if micro_i % ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -185,7 +190,7 @@ def main():
                 step += 1
 
                 # ---- logging & checkpointing ----
-                if step % train_log_interval == 0:
+                if step % TRAIN_LOG_INTERVAL == 0:
                     avg_loss = epoch_total_loss / max(1, epoch_batches)
                     ppl = math.exp(avg_loss) if avg_loss < 20 else float('inf')
                     lr = scheduler.get_last_lr()[0]
@@ -220,15 +225,15 @@ def main():
                     epoch_total_loss = 0.0
                     epoch_batches = 0
 
-                if step % sample_interval == 0:
+                if step % SAMPLE_INTERVAL == 0:
                     model.eval()
                     with torch.no_grad():
                         gen_ids = model.generate(
                             fixed_prompt_ids,
-                            max_new_tokens=sample_length,
+                            max_new_tokens=SAMPLE_LENGTH,
                             temperature=0.6,
-                            top_p=0.92,
                             top_k=None,
+                            top_p=0.92,
                             eos_id=tokenizer.EOS,
                         )
                     new_tokens = gen_ids[0][fixed_prompt_ids.size(1):]
