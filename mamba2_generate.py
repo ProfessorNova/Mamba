@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from lib.byte_tokenizer import ByteTokenizer
+from lib.gpt2_tokenizer_wrapper import GPT2TokenizerWrapper
 from lib.mamba2 import MambaLM
 
 
@@ -27,12 +27,18 @@ def main():
     config = ckpt["config"]
 
     # Rebuild model and load weights
-    model = MambaLM(**config).to(device)
+    model = MambaLM(
+        vocab_size=config["vocab_size"],
+        d_model=config["d_model"],
+        n_layers=config["n_layers"],
+        n_heads=config["n_heads"],
+        d_state=config["d_state"],
+    ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     # Load tokenizer
-    tokenizer = ByteTokenizer(add_eos=False)
+    tokenizer = GPT2TokenizerWrapper(add_eos=False)
 
     # Build prompt
     prompt = args.input

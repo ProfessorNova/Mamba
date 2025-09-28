@@ -4,11 +4,11 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from datasets import load_dataset
+from datasets import load_dataset, tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from lib.byte_tokenizer import ByteTokenizer
+from lib.gpt2_tokenizer_wrapper import GPT2TokenizerWrapper
 from lib.mamba2 import MambaLM
 
 
@@ -27,27 +27,22 @@ def seed_everything(seed: int = 1337):
 
 
 class PackedLM(Dataset):
-    """
-    Concatenate all tokenized examples (each ends with EOS) and slice
-    fixed windows of length (max_len + 1) to form (input, target) pairs.
-    """
-
-    def __init__(self, hf_split, tokenizer: ByteTokenizer, max_len: int, stride: Optional[int] = None):
+    def __init__(self, hf_split, tokenizer: GPT2TokenizerWrapper, max_len: int, stride: Optional[int] = None):
         self.max_len = max_len
         window_len = max_len + 1  # input+target length
         self.stride = window_len if stride is None else stride  # non-overlapping by default
 
         buf: list[int] = []
-        for rec in hf_split:
+        for rec in tqdm(hf_split, desc="Tokenizing dataset"):
             text = (rec["text"] or "").strip()
-            ids = tokenizer.encode(text)  # already appends EOS (by construction)
+            ids = tokenizer.encode(text)  # appends EOS when add_eos=True
             if not ids:
                 ids = [tokenizer.EOS]
             buf.extend(ids)
 
         self.seqs: list[list[int]] = []
         # Build windows [i : i+window_len] with given stride
-        for i in range(0, max(0, len(buf) - window_len + 1), self.stride):
+        for i in tqdm(range(0, max(0, len(buf) - window_len + 1), self.stride), desc="Packing dataset"):
             self.seqs.append(buf[i:i + window_len])
 
         if not self.seqs:
@@ -75,10 +70,12 @@ def main():
         device = torch.device('cpu')
     print(f'Using device: {device}')
 
-    tokenizer = ByteTokenizer(add_eos=True)
-    tok_no_eos = ByteTokenizer(add_eos=False)
+    # ---- GPT-2 tokenizers ----
+    tokenizer = GPT2TokenizerWrapper(add_eos=True)
+    tok_no_eos = GPT2TokenizerWrapper(add_eos=False)
+
     MAX_LEN = 512
-    BATCH_SIZE = 32
+    BATCH_SIZE = 8
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
 
@@ -93,8 +90,8 @@ def main():
 
     print("Total tokens:", _fmt(len(stories_train_ds) * MAX_LEN))
     sample_inputs, sample_targets = next(iter(train_loader))
-    print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0])}\n")
-    print(f"Example target:\n\n{tokenizer.decode(sample_targets[0])}\n")
+    print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0].tolist())}\n")
+    print(f"Example target:\n\n{tokenizer.decode(sample_targets[0].tolist())}\n")
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
@@ -107,7 +104,7 @@ def main():
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    TRAIN_EPOCHS = 1
+    TRAIN_EPOCHS = 3
     TRAIN_LOG_INTERVAL = 10
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
@@ -210,7 +207,6 @@ def main():
                             "n_layers": n_layers,
                             "n_heads": n_heads,
                             "d_state": d_state,
-                            "max_len": MAX_LEN,
                         },
                         "step": step,
                         "epoch": epoch,
