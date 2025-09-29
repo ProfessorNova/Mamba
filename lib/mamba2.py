@@ -97,9 +97,9 @@ class MambaBlock(nn.Module):
         # Project once into all SSD pieces: X, A, B, C
         # X: (n_heads * d_head) == d_model
         # A: (n_heads)
-        # B: (d_state)  -- shared across heads
-        # C: (d_state)  -- shared across heads
-        proj_out = d_model + n_heads + 2 * d_state  # B and C are shared across heads
+        # B: (n_heads * d_state)
+        # C: (n_heads * d_state)
+        proj_out = d_model + n_heads + 2 * n_heads * d_state  # per-head B,C
         self.linear_proj = nn.Linear(d_model, proj_out, bias=False)
 
         # Depthwise 1D conv for local mixing (causal via manual left padding)
@@ -154,23 +154,23 @@ class MambaBlock(nn.Module):
         x_mixed = F.silu(x_conv.transpose(1, 2)) * x  # (B, L, D)
 
         # One big projection -> split into X, A, B, C
-        proj = self.linear_proj(x_mixed)  # (B, L, D + H + 2*N)
+        proj = self.linear_proj(x_mixed)  # (B, L, D + H + 2*H*N)
         off0 = 0
         x_part = proj[..., off0: off0 + D]
         off0 += D  # (B, L, D)
         a_part = proj[..., off0: off0 + H]
         off0 += H  # (B, L, H)
-        b_part = proj[..., off0: off0 + N]
-        off0 += N  # (B, L, N)
-        c_part = proj[..., off0: off0 + N]  # (B, L, N)
+        b_part = proj[..., off0: off0 + H * N]
+        off0 += H * N  # (B, L, H*N)
+        c_part = proj[..., off0: off0 + H * N]
 
         # Reshape / map to SSD pieces
         X = x_part.view(Bsz, L, H, P).contiguous()  # (B, L, H, P)
         A = F.logsigmoid(a_part)  # (B, L, H), ensures stability
 
         # Share B,C across heads -> broadcast, then apply activation
-        Bv = F.silu(b_part.unsqueeze(-2).expand(Bsz, L, H, N))  # (B, L, H, N)
-        Cv = F.silu(c_part.unsqueeze(-2).expand(Bsz, L, H, N))  # (B, L, H, N)
+        Bv = F.silu(b_part.view(Bsz, L, H, N).contiguous())  # (B, L, H, N)
+        Cv = F.silu(c_part.view(Bsz, L, H, N).contiguous())  # (B, L, H, N)
         X = F.silu(X)
 
         # Optional resets: break recurrence between t-1 and t where reset_mask[t] = 1

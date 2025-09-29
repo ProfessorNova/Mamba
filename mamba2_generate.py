@@ -55,6 +55,7 @@ def main():
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            eos_id=tokenizer.eos_token_id,
         )
 
     # Strip the prompt part for readability

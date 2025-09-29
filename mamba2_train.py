@@ -98,13 +98,13 @@ def main():
     d_model = 768
     n_layers = 12
     n_heads = 12
-    d_state = d_model // n_heads
+    d_state = 294
 
     model = MambaLM(vocab_size, d_model, n_layers, n_heads, d_state).to(device)
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    TRAIN_EPOCHS = 3
+    TRAIN_EPOCHS = 1
     TRAIN_LOG_INTERVAL = 10
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
