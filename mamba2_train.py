@@ -1,5 +1,6 @@
 import datetime
 import math
+import time
 from typing import Optional
 
 import torch
@@ -75,7 +76,7 @@ def main():
     tok_no_eos = GPT2TokenizerWrapper(add_eos=False)
 
     MAX_LEN = 512
-    BATCH_SIZE = 8
+    BATCH_SIZE = 16
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
 
@@ -95,10 +96,10 @@ def main():
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
-    d_model = 768
-    n_layers = 12
-    n_heads = 12
-    d_state = 294
+    d_model = 384
+    n_layers = 8
+    n_heads = 8
+    d_state = 64
 
     model = MambaLM(vocab_size, d_model, n_layers, n_heads, d_state).to(device)
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
@@ -108,7 +109,7 @@ def main():
     TRAIN_LOG_INTERVAL = 10
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
-    ACCUM_STEPS = 32
+    ACCUM_STEPS = 16
     total_steps = int(len(train_loader) * TRAIN_EPOCHS / ACCUM_STEPS)
     print(f'Total training steps: {_fmt(total_steps)}')
     print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
@@ -148,6 +149,7 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     step = 0
     best_loss = float('inf')
+    last_step_time = time.perf_counter()
 
     for epoch in range(TRAIN_EPOCHS):
         epoch_total_loss = 0.0
@@ -185,6 +187,8 @@ def main():
 
                 # ---- bookkeeping ----
                 step += 1
+                step_time = time.perf_counter() - last_step_time
+                last_step_time = time.perf_counter()
 
                 # ---- logging & checkpointing ----
                 if step % TRAIN_LOG_INTERVAL == 0:
@@ -194,8 +198,9 @@ def main():
                     writer.add_scalar('train/loss', avg_loss, step)
                     writer.add_scalar('train/ppl', ppl, step)
                     writer.add_scalar('train/lr', lr, step)
-                    print(f'Step {step}, Loss: {avg_loss:.4f}, PPL: {ppl:.2f}, LR: {lr:.2e}')
-
+                    writer.add_scalar('train/step_time_s', step_time, step)
+                    print(
+                        f'Step {step}, Loss: {avg_loss:.4f}, PPL: {ppl:.2f}, LR: {lr:.2e}, StepTime: {step_time * 1000:.1f}ms')
                     # save checkpoints
                     ckpt = {
                         "model_state_dict": model.state_dict(),
@@ -227,9 +232,9 @@ def main():
                         gen_ids = model.generate(
                             fixed_prompt_ids,
                             max_new_tokens=SAMPLE_LENGTH,
-                            temperature=0.6,
-                            top_k=None,
-                            top_p=0.92,
+                            temperature=0.7,
+                            top_k=50,
+                            top_p=None,
                             eos_id=tokenizer.EOS,
                         )
                     new_tokens = gen_ids[0][fixed_prompt_ids.size(1):]

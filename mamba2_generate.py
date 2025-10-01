@@ -15,9 +15,9 @@ def main():
         help="Input text"
     )
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=None, help="Top-k sampling")
-    parser.add_argument("--top_p", type=float, default=0.92, help="Top-p sampling")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--top_p", type=float, default=None, help="Top-p sampling")
     args = parser.parse_args()
 
     device = torch.device("cpu")
