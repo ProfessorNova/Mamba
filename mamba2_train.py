@@ -79,8 +79,7 @@ def main():
     BATCH_SIZE = 2
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
-    # # just a small subset for quick testing
-    # stories_ds = stories_ds.select(range(10_000))
+    # stories_ds = stories_ds.select(range(30_000))  # for quick testing
 
     stories_train_ds = PackedLM(stories_ds, tokenizer, max_len=MAX_LEN)
 
@@ -96,33 +95,42 @@ def main():
     print(f"Example input:\n\n{tokenizer.decode(sample_inputs[0].tolist())}\n")
     print(f"Example target:\n\n{tokenizer.decode(sample_targets[0].tolist())}\n")
 
-    # Model hyperparameters
     vocab_size = len(tokenizer)
-    d_model = 1024
+    d_model = 768
     n_layers = 24
-    n_heads = 16
     d_state = 128
+    d_conv = 4
+    expand = 2
+    headdim = 64
+    ngroups = 1
+    model = MambaLM(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=n_layers,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        headdim=headdim,
+        ngroups=ngroups,
+    ).to(device)
 
-    model = MambaLM(vocab_size, d_model, n_layers, n_heads, d_state).to(device)
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    TRAIN_EPOCHS = 3
+    TRAIN_EPOCHS = 2
     TRAIN_LOG_INTERVAL = 10
-    SAVE_INTERVAL = 300
+    SAVE_INTERVAL = 100
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
-    ACCUM_STEPS = 64
+    ACCUM_STEPS = 128
     total_steps = int(len(train_loader) * TRAIN_EPOCHS / ACCUM_STEPS)
     print(f'Total training steps: {_fmt(total_steps)}')
     print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
 
     # Optimizer, scheduler, criterion
-    BASE_LR = 3e-4
+    BASE_LR = 6e-4
     MIN_LR = 1e-5
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), fused=True
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, betas=(0.9, 0.95))
     criterion = nn.CrossEntropyLoss()
 
     # Cosine w/ warmup scheduler (step-wise)
@@ -216,8 +224,10 @@ def main():
                             "vocab_size": vocab_size,
                             "d_model": d_model,
                             "n_layers": n_layers,
-                            "n_heads": n_heads,
                             "d_state": d_state,
+                            "d_conv": d_conv,
+                            "expand": expand,
+                            "headdim": headdim,
                         },
                         "step": step,
                         "epoch": epoch,

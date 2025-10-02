@@ -31,8 +31,11 @@ def main():
         vocab_size=config["vocab_size"],
         d_model=config["d_model"],
         n_layers=config["n_layers"],
-        n_heads=config["n_heads"],
         d_state=config["d_state"],
+        d_conv=config["d_conv"],
+        expand=config["expand"],
+        headdim=config["headdim"],
+        ngroups=config["ngroups"],
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
