@@ -99,7 +99,7 @@ class MambaBlock(nn.Module):
       d_conv: depthwise conv kernel size (causal)
       expand: inner expansion factor; d_inner = expand * d_model
       headdim: head dimension (P)
-      ngroups: number of groups for (B, C)
+      ngroups: number of groups for (B, C) (set to None to use full n_heads)
     """
 
     def __init__(
@@ -264,7 +264,7 @@ class MambaLM(nn.Module):
             d_state: int = 64,
             d_conv: int = 4,
             expand: int = 2,
-            headdim: int = 128,
+            headdim: int = 64,
             ngroups: int = 1,
     ) -> None:
         super().__init__()

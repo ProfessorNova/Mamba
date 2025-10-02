@@ -76,7 +76,7 @@ def main():
     tok_no_eos = GPT2TokenizerWrapper(add_eos=False)
 
     MAX_LEN = 1024
-    BATCH_SIZE = 2
+    BATCH_SIZE = 4
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
     # stories_ds = stories_ds.select(range(30_000))  # for quick testing
@@ -97,7 +97,7 @@ def main():
 
     vocab_size = len(tokenizer)
     d_model = 768
-    n_layers = 24
+    n_layers = 12
     d_state = 128
     d_conv = 4
     expand = 2
@@ -122,7 +122,7 @@ def main():
     SAVE_INTERVAL = 100
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
-    ACCUM_STEPS = 128
+    ACCUM_STEPS = 64
     total_steps = int(len(train_loader) * TRAIN_EPOCHS / ACCUM_STEPS)
     print(f'Total training steps: {_fmt(total_steps)}')
     print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
