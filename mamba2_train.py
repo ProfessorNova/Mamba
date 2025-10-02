@@ -117,7 +117,7 @@ def main():
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    TRAIN_EPOCHS = 2
+    TRAIN_EPOCHS = 3
     TRAIN_LOG_INTERVAL = 10
     SAVE_INTERVAL = 100
     SAMPLE_INTERVAL = 100
