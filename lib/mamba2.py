@@ -102,6 +102,9 @@ class MambaBlock(nn.Module):
         proj_out = d_model + n_heads + 2 * n_heads * d_state  # per-head B,C
         self.linear_proj = nn.Linear(d_model, proj_out, bias=False)
 
+        # Gate projection
+        self.gate_proj = nn.Linear(d_model, d_model, bias=False)
+
         # Depthwise 1D conv for local mixing (causal via manual left padding)
         self.conv1d = nn.Conv1d(
             in_channels=d_model,
@@ -111,9 +114,6 @@ class MambaBlock(nn.Module):
             bias=False,
             padding=0,
         )
-
-        # Gate projection
-        self.gate_proj = nn.Linear(d_model, d_model, bias=False)
 
         # Normalization before output projection
         self.norm = RMSNorm(d_model)
@@ -144,40 +144,39 @@ class MambaBlock(nn.Module):
         Bsz, L, D = x.shape
         H, P, N = self.n_heads, self.d_head, self.d_state
 
-        # Local (causal) depthwise mixing + SiLU gate
-        # expects (B, C, L); left-pad by (k-1) for causality.
+        proj = self.linear_proj(x)
+
+        off0 = 0
+        x_part = proj[..., off0: off0 + D]
+        off0 += D
+        a_part = proj[..., off0: off0 + H]
+        off0 += H
+        b_part = proj[..., off0: off0 + H * N]
+        off0 += H * N
+        c_part = proj[..., off0: off0 + H * N]
+
+        # Map to SSD pieces (A,B,C unaffected by conv)
+        X = x_part.view(Bsz, L, H, P).contiguous()  # (B, L, H, P)
+        A = F.logsigmoid(a_part)  # (B, L, H)
+        Bv = F.silu(b_part.view(Bsz, L, H, N).contiguous())
+        Cv = F.silu(c_part.view(Bsz, L, H, N).contiguous())
+        X = F.silu(X)
+
+        # Local mixing via depthwise conv
         x_ch = x.transpose(1, 2)  # (B, D, L)
         if self.d_conv > 1:
             x_conv = self.conv1d(F.pad(x_ch, (self.d_conv - 1, 0)))  # (B, D, L)
         else:
-            x_conv = self.conv1d(x_ch)  # degenerate 1x1 depthwise
-        x_mixed = F.silu(x_conv.transpose(1, 2)) * x  # (B, L, D)
+            x_conv = self.conv1d(x_ch)
+        x_loc = F.silu(x_conv.transpose(1, 2))  # (B, L, D)
 
-        # One big projection -> split into X, A, B, C
-        proj = self.linear_proj(x_mixed)  # (B, L, D + H + 2*H*N)
-        off0 = 0
-        x_part = proj[..., off0: off0 + D]
-        off0 += D  # (B, L, D)
-        a_part = proj[..., off0: off0 + H]
-        off0 += H  # (B, L, H)
-        b_part = proj[..., off0: off0 + H * N]
-        off0 += H * N  # (B, L, H*N)
-        c_part = proj[..., off0: off0 + H * N]
-
-        # Reshape / map to SSD pieces
-        X = x_part.view(Bsz, L, H, P).contiguous()  # (B, L, H, P)
-        A = F.logsigmoid(a_part)  # (B, L, H), ensures stability
-
-        # Share B,C across heads -> broadcast, then apply activation
-        Bv = F.silu(b_part.view(Bsz, L, H, N).contiguous())  # (B, L, H, N)
-        Cv = F.silu(c_part.view(Bsz, L, H, N).contiguous())  # (B, L, H, N)
-        X = F.silu(X)
+        # Inject local mixing into the SSM input branch
+        X = X * x_loc.view(Bsz, L, H, P)
 
         # Optional resets: break recurrence between t-1 and t where reset_mask[t] = 1
         if reset_mask is not None:
-            # shape (B, L, 1) -> broadcast over H
-            reset_log = (-1e9) * reset_mask.unsqueeze(-1).to(A.dtype)  # (B, L, 1)
-            A = A + reset_log  # (B, L, H)
+            reset_log = (-1e9) * reset_mask.unsqueeze(-1).to(A.dtype)
+            A = A + reset_log
 
         # SSD compute
         Y, final_state = ssd(
@@ -189,7 +188,8 @@ class MambaBlock(nn.Module):
             initial_states=state,
         )  # Y: (B, L, H, P)
 
-        gate = torch.sigmoid(self.gate_proj(x_mixed))  # (B, L, D)
+        # Output gate
+        gate = torch.sigmoid(self.gate_proj(x))     # (B, L, D)
         y_core = Y.reshape(Bsz, L, D) * gate  # selective gating on SSM output
         y = self.out_proj(self.norm(y_core))
 

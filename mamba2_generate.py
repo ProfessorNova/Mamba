@@ -8,7 +8,7 @@ from lib.mamba2 import MambaLM
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text with a Mamba2 model")
-    parser.add_argument("--ckpt", type=str, default="last.pt", help="Path to checkpoint file")
+    parser.add_argument("--ckpt", type=str, default="best.pt", help="Path to checkpoint file")
     parser.add_argument(
         "--input", type=str,
         default="Once upon a time, in a nice little town, there lived a big dragon.",
@@ -60,6 +60,7 @@ def main():
 
     # Strip the prompt part for readability
     new_tokens = gen_ids[0, input_ids.shape[1]:]
+    prompt = tokenizer.decode(input_ids[0].tolist())
     output = tokenizer.decode(new_tokens.tolist())
     print(f"{prompt}{output}", end="\n\n")
 

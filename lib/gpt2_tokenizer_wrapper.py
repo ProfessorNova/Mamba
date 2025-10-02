@@ -28,16 +28,6 @@ class GPT2TokenizerWrapper:
             ids.append(self.EOS)
         return ids
 
-    def encode_batch(self, texts: List[str]) -> List[List[int]]:
-        """
-        Fast batch tokenization via tiktoken's Rust backend.
-        Mirrors encode(): appends EOS if add_eos=True; otherwise returns raw ids.
-        """
-        ids_batch = self._enc.encode_ordinary_batch([t or "" for t in texts])
-        if self.add_eos:
-            return [ids + [self.EOS] for ids in ids_batch]
-        return ids_batch
-
     # ---------- Decoding ----------
     def decode(self, ids: Union[Iterable[int], torch.Tensor], skip_special_tokens: bool = False) -> str:
         if hasattr(ids, "tolist"):

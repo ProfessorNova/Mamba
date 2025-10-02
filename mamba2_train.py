@@ -75,10 +75,12 @@ def main():
     tokenizer = GPT2TokenizerWrapper(add_eos=True)
     tok_no_eos = GPT2TokenizerWrapper(add_eos=False)
 
-    MAX_LEN = 512
-    BATCH_SIZE = 16
+    MAX_LEN = 1024
+    BATCH_SIZE = 2
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
+    # # just a small subset for quick testing
+    # stories_ds = stories_ds.select(range(10_000))
 
     stories_train_ds = PackedLM(stories_ds, tokenizer, max_len=MAX_LEN)
 
@@ -96,29 +98,30 @@ def main():
 
     # Model hyperparameters
     vocab_size = len(tokenizer)
-    d_model = 384
-    n_layers = 8
-    n_heads = 8
-    d_state = 64
+    d_model = 1024
+    n_layers = 24
+    n_heads = 16
+    d_state = 128
 
     model = MambaLM(vocab_size, d_model, n_layers, n_heads, d_state).to(device)
     print("Model parameters:", _fmt(sum(p.numel() for p in model.parameters())))
 
     # Training hyperparameters
-    TRAIN_EPOCHS = 1
+    TRAIN_EPOCHS = 3
     TRAIN_LOG_INTERVAL = 10
+    SAVE_INTERVAL = 300
     SAMPLE_INTERVAL = 100
     SAMPLE_LENGTH = 256
-    ACCUM_STEPS = 16
+    ACCUM_STEPS = 64
     total_steps = int(len(train_loader) * TRAIN_EPOCHS / ACCUM_STEPS)
     print(f'Total training steps: {_fmt(total_steps)}')
     print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
 
     # Optimizer, scheduler, criterion
-    BASE_LR = 6e-4
+    BASE_LR = 3e-4
     MIN_LR = 1e-5
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), weight_decay=0.1,
+        model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), fused=True
     )
     criterion = nn.CrossEntropyLoss()
 
@@ -201,7 +204,10 @@ def main():
                     writer.add_scalar('train/step_time_s', step_time, step)
                     print(
                         f'Step {step}, Loss: {avg_loss:.4f}, PPL: {ppl:.2f}, LR: {lr:.2e}, StepTime: {step_time * 1000:.1f}ms')
+
+                if step % SAVE_INTERVAL == 0:
                     # save checkpoints
+                    avg_loss = epoch_total_loss / max(1, epoch_batches)
                     ckpt = {
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -217,10 +223,12 @@ def main():
                         "epoch": epoch,
                     }
                     torch.save(ckpt, f'{save_dir}/last.pt')
+                    print(f'Checkpoint saved to {save_dir}/last.pt')
 
                     if avg_loss < best_loss:
                         best_loss = avg_loss
                         torch.save(ckpt, f'{save_dir}/best.pt')
+                        print(f'New best model (loss {best_loss:.4f}), saved to best.pt')
 
                     # reset running stats
                     epoch_total_loss = 0.0
@@ -247,8 +255,6 @@ def main():
 
         print(f'Epoch {epoch + 1} complete')
 
-    # Save final copies
-    torch.save(model.state_dict(), f'{save_dir}/final.pt')
     print("Training complete.")
 
 
