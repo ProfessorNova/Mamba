@@ -2,22 +2,23 @@ import argparse
 
 import torch
 
-from lib.gpt2_tokenizer_wrapper import GPT2TokenizerWrapper
+from lib.byte_tokenizer import ByteTokenizer
 from lib.mamba2 import MambaLM
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text with a Mamba2 model")
-    parser.add_argument("--ckpt", type=str, default="best.pt", help="Path to checkpoint file")
+    parser.add_argument("--ckpt", type=str, default="runs/2025-10-03_11-29-15_mamba2/best.pt",
+                        help="Path to checkpoint file")
     parser.add_argument(
         "--input", type=str,
         default="Once upon a time, in a nice little town, there lived a big dragon.",
         help="Input text"
     )
-    parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum new tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
-    parser.add_argument("--top_p", type=float, default=None, help="Top-p sampling")
+    parser.add_argument("--top_k", type=int, default=None, help="Top-k sampling")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -35,13 +36,12 @@ def main():
         d_conv=config["d_conv"],
         expand=config["expand"],
         headdim=config["headdim"],
-        ngroups=config["ngroups"],
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     # Load tokenizer
-    tokenizer = GPT2TokenizerWrapper(add_eos=False)
+    tokenizer = ByteTokenizer(add_eos=False)
 
     # Build prompt
     prompt = args.input

@@ -9,7 +9,7 @@ from datasets import load_dataset, tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from lib.gpt2_tokenizer_wrapper import GPT2TokenizerWrapper
+from lib.byte_tokenizer import ByteTokenizer
 from lib.mamba2 import MambaLM
 
 
@@ -28,7 +28,7 @@ def seed_everything(seed: int = 1337):
 
 
 class PackedLM(Dataset):
-    def __init__(self, hf_split, tokenizer: GPT2TokenizerWrapper, max_len: int, stride: Optional[int] = None):
+    def __init__(self, hf_split, tokenizer, max_len: int, stride: Optional[int] = None):
         self.max_len = max_len
         window_len = max_len + 1  # input+target length
         self.stride = window_len if stride is None else stride  # non-overlapping by default
@@ -72,14 +72,13 @@ def main():
     print(f'Using device: {device}')
 
     # ---- GPT-2 tokenizers ----
-    tokenizer = GPT2TokenizerWrapper(add_eos=True)
-    tok_no_eos = GPT2TokenizerWrapper(add_eos=False)
+    tokenizer = ByteTokenizer(add_eos=True)
+    tok_no_eos = ByteTokenizer(add_eos=False)
 
     MAX_LEN = 1024
     BATCH_SIZE = 4
 
     stories_ds = load_dataset('roneneldan/TinyStories', split='train')
-    # stories_ds = stories_ds.select(range(30_000))  # for quick testing
 
     stories_train_ds = PackedLM(stories_ds, tokenizer, max_len=MAX_LEN)
 
@@ -128,7 +127,7 @@ def main():
     print(f'Tokens per step: {_fmt(BATCH_SIZE * MAX_LEN * ACCUM_STEPS)}')
 
     # Optimizer, scheduler, criterion
-    BASE_LR = 6e-4
+    BASE_LR = 3e-4
     MIN_LR = 1e-5
     optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, betas=(0.9, 0.95))
     criterion = nn.CrossEntropyLoss()
@@ -228,6 +227,7 @@ def main():
                             "d_conv": d_conv,
                             "expand": expand,
                             "headdim": headdim,
+                            "ngroups": ngroups,
                         },
                         "step": step,
                         "epoch": epoch,
@@ -251,8 +251,8 @@ def main():
                             fixed_prompt_ids,
                             max_new_tokens=SAMPLE_LENGTH,
                             temperature=0.7,
-                            top_k=50,
-                            top_p=None,
+                            top_k=None,
+                            top_p=0.9,
                             eos_id=tokenizer.EOS,
                         )
                     new_tokens = gen_ids[0][fixed_prompt_ids.size(1):]
